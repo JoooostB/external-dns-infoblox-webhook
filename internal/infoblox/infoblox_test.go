@@ -1099,6 +1099,55 @@ func TestExtendedRequestMaxResultsBuilder(t *testing.T) {
 
 	assert.True(t, req.URL.Query().Get("_max_results") == "")
 }
+func TestDeserializeEAs(t *testing.T) {
+	tests := []struct {
+		name          string
+		extAttrJSON   string
+		expected      map[string]interface{}
+		expectedError bool
+	}{
+		{
+			name:          "Empty JSON string",
+			extAttrJSON:   "",
+			expected:      map[string]interface{}{},
+			expectedError: false,
+		},
+		{
+			name:        "Valid JSON string",
+			extAttrJSON: `{"CMP Type":"external-dns","Cloud API Owned":"True","Tenant ID":1337}`,
+			expected: map[string]interface{}{
+				"CMP Type":        "external-dns",
+				"Cloud API Owned": "True",
+				"Tenant ID":       float64(1337),
+			},
+			expectedError: false,
+		},
+		{
+			name:          "Invalid JSON string",
+			extAttrJSON:   `{"key1": "value1", "key2": 2`,
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "Stringified JSON object",
+			extAttrJSON:   `"{\"CMP Type\":\"external-dns\",\"Cloud API Owned\":"True",\"Tenant ID\":1337}"`,
+			expected:      nil,
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := deserializeEAs(tt.extAttrJSON)
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, result)
+			}
+		})
+	}
+}
 
 //func TestGetObject(t *testing.T) {
 //	hostCfg := ibclient.HostConfig{}
