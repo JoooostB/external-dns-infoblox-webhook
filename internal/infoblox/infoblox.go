@@ -46,6 +46,7 @@ const (
 	infobloxCreate                    = "CREATE"
 	infobloxDelete                    = "DELETE"
 	infobloxUpdate                    = "UPDATE"
+	inAddrArpaSuffix                  = ".in-addr.arpa"
 )
 
 func isNotFoundError(err error) bool {
@@ -261,22 +262,39 @@ func (p *Provider) Records(_ context.Context) (endpoints []*endpoint.Endpoint, e
 		endpoints = append(endpoints, endpointsNS...)
 
 		if p.config.CreatePTR {
-			arpaZone, err := rfc2317.CidrToInAddr(zone.Fqdn)
-			if err == nil {
+			// Support two patterns:
+			//  1) CIDR "zones" (e.g. 192.168.1.0/24) -> convert to in-addr.arpa zone via RFC2317
+			//  2) Standard reverse zones (e.g. 1.168.192.in-addr.arpa) -> query directly
+			var ptrZone string
+			switch {
+			case isCIDR(zone.Fqdn):
+				arpaZone, err := rfc2317.CidrToInAddr(zone.Fqdn)
+				if err != nil {
+					log.Debugf("Could not fetch PTR records from zone '%s': %s", zone.Fqdn, err)
+					break
+				}
+				ptrZone = arpaZone
+			case isInAddrArpaZone(zone.Fqdn):
+				ptrZone = strings.TrimSuffix(zone.Fqdn, ".")
+			default:
+				// forward zone; ignore for PTR fetching
+				break
+			}
+
+			if ptrZone != "" {
 				var resP []ibclient.RecordPTR
 				objP := ibclient.NewEmptyRecordPTR()
 				objP.View = p.config.View
 				objP.Ea = extAttrs
-				objP.Zone = arpaZone
-				err = PagingGetObject(p.client, objP, "", map[string]string{"zone": arpaZone, "view": p.config.View}, &resP)
+				objP.Zone = ptrZone
+
+				err = PagingGetObject(p.client, objP, "", map[string]string{"zone": ptrZone, "view": p.config.View}, &resP)
 				if err != nil && !isNotFoundError(err) {
 					metrics.FailedApiCallsTotal.Inc()
 					return nil, fmt.Errorf("could not fetch PTR records from zone '%s': %w", zone.Fqdn, err)
 				}
 				endpointsPTR := ToPTRResponseMap(resP).ToEndpoints()
 				endpoints = append(endpoints, endpointsPTR...)
-			} else {
-				log.Debugf("Could not fetch PTR records from zone '%s': %s", zone.Fqdn, err)
 			}
 		}
 	}
@@ -694,6 +712,33 @@ func (p *Provider) findZone(zones []*ibclient.ZoneAuth, name string) *ibclient.Z
 
 func (p *Provider) findReverseZone(zones []*ibclient.ZoneAuth, name string) *ibclient.ZoneAuth {
 	ip := net.ParseIP(name)
+	if ip == nil {
+		return nil
+	}
+
+	// Prefer standard reverse zones like "1.168.192.in-addr.arpa" by longest-suffix match
+	// against the computed PTR record name "137.1.168.192.in-addr.arpa".
+	ptrName, err := ptrNameFromIPv4(ip)
+	if err == nil {
+		var best *ibclient.ZoneAuth
+		for idx := range zones {
+			z := zones[idx]
+			fqdn := strings.TrimSuffix(z.Fqdn, ".")
+			if !isInAddrArpaZone(fqdn) {
+				continue
+			}
+			if strings.HasSuffix(ptrName, "."+fqdn) || strings.EqualFold(ptrName, fqdn) {
+				if best == nil || len(fqdn) > len(strings.TrimSuffix(best.Fqdn, ".")) {
+					best = z
+				}
+			}
+		}
+		if best != nil {
+			return best
+		}
+	}
+
+	// Fallback to legacy CIDR-based logic (for environments that store reverse zones as CIDR strings).
 	networks := map[int]*ibclient.ZoneAuth{}
 	maxMask := 0
 
@@ -701,13 +746,14 @@ func (p *Provider) findReverseZone(zones []*ibclient.ZoneAuth, name string) *ibc
 		_, rZoneNet, err := net.ParseCIDR(zone.Fqdn)
 		if err != nil {
 			log.WithError(err).Debugf("fqdn %s is no cidr", zone.Fqdn)
-		} else {
-			if rZoneNet.Contains(ip) {
-				_, mask := rZoneNet.Mask.Size()
-				networks[mask] = zones[i]
-				if mask > maxMask {
-					maxMask = mask
-				}
+			continue
+		}
+
+		if rZoneNet.Contains(ip) {
+			ones, _ := rZoneNet.Mask.Size()
+			networks[ones] = zones[i]
+			if ones > maxMask {
+				maxMask = ones
 			}
 		}
 	}
@@ -903,4 +949,23 @@ func deserializeEAs(extAttrJSON string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("cannot process 'ext_attrs' field: %w", err)
 	}
 	return extAttrs, nil
+}
+
+func isCIDR(s string) bool {
+	_, _, err := net.ParseCIDR(s)
+	return err == nil
+}
+
+func isInAddrArpaZone(s string) bool {
+	s = strings.TrimSuffix(s, ".")
+	return strings.HasSuffix(strings.ToLower(s), inAddrArpaSuffix)
+}
+
+func ptrNameFromIPv4(ip net.IP) (string, error) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "", fmt.Errorf("not an ipv4 address: %v", ip)
+	}
+	// 192.168.1.137 -> 137.1.168.192.in-addr.arpa
+	return fmt.Sprintf("%d.%d.%d.%d%s", ip4[3], ip4[2], ip4[1], ip4[0], inAddrArpaSuffix), nil
 }

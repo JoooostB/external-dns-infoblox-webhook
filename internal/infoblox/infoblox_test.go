@@ -33,6 +33,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
@@ -1259,4 +1260,28 @@ func (r *mockRequestor) SendRequest(req *http.Request) (res []byte, err error) {
 
 func validateEndpoints(t *testing.T, endpoints []*endpoint.Endpoint, expected []*endpoint.Endpoint) {
 	assert.True(t, SameEndpoints(endpoints, expected), "actual and expected endpoints don't match. %s:%s", endpoints, expected)
+}
+
+func TestFindReverseZone_InAddrArpaLongestSuffixMatch(t *testing.T) {
+	p := &Provider{}
+	zones := []*ibclient.ZoneAuth{
+		{Fqdn: "168.192.in-addr.arpa"},
+		{Fqdn: "1.168.192.in-addr.arpa"},
+	}
+
+	z := p.findReverseZone(zones, "192.168.1.137")
+	require.NotNil(t, z)
+	require.Equal(t, "1.168.192.in-addr.arpa", z.Fqdn)
+}
+
+func TestFindReverseZone_CIDRFallback(t *testing.T) {
+	p := &Provider{}
+	zones := []*ibclient.ZoneAuth{
+		{Fqdn: "192.168.1.0/24"},
+		{Fqdn: "192.168.0.0/16"},
+	}
+
+	z := p.findReverseZone(zones, "192.168.1.137")
+	require.NotNil(t, z)
+	require.Equal(t, "192.168.1.0/24", z.Fqdn)
 }
